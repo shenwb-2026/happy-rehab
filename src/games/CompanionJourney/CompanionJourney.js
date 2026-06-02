@@ -1,704 +1,837 @@
-/**
- * 陪伴之旅游戏 — CompanionJourney
- *
- * 养成叙事类游戏。适配喜欢情感互动、养成角色、积累成就感的儿童。
- *
- * 核心机制：
- * - 陪伴角色（狐狸/兔子/恐龙）固定在屏幕中央
- * - 每一步触发弹跳动画 + 粒子 + 路径瓷砖生成
- * - 连续步数系统 + 饥饿值进度条
- * - 场景解锁：森林→海滩→太空（跨训练累计步数）
- * - 训练仪式：开场打哈欠 + 收尾庆祝入睡
- *
- * 所有角色和场景由 Canvas 2D 代码绘制，无外部图片资源。
- */
+// 陪伴之旅游戏（规格书 9.3 节）
+// 养成叙事类——行走→角色弹跳+粒子+路径瓷砖生成。Canvas 2D 全量渲染，无外部图片。
+// 美术规范：天蓝色背景，圆润卡通角色，2-3px 黑色描边，大双高光眼睛。
 
 import { GameInterface } from '../GameInterface.js';
 import { GAME_CONFIG } from '../../config.js';
+import { LocalStore } from '../../storage/localstore.js';
 
-// ─── 常量 ─────────────────────────────────────────────────────
-const STREAK_BONUS_AT = GAME_CONFIG.streakBonusAt || 5;
-const STREAK_TIMEOUT_MS = GAME_CONFIG.streakTimeoutMs || 5000;
-const HUNGER_PER_STEP = GAME_CONFIG.hungerIncreasePerStep || 5;
-const BOUNCE_DURATION_MS = GAME_CONFIG.bounceAnimationMs || 350;
-const PARTICLE_LIFETIME_MS = GAME_CONFIG.particleLifetimeMs || 700;
-const STREAK_DANCE_MS = GAME_CONFIG.streakDanceMs || 2000;
-const BONUS_TILES = GAME_CONFIG.streakBonusTiles || 5;
-const SCENE_UNLOCK_STEPS = 50;
+const STREAK_BONUS_AT  = GAME_CONFIG.streakBonusAt          ?? 5;
+const STREAK_TIMEOUT   = GAME_CONFIG.streakTimeoutMs         ?? 5000;
+const HUNGER_PER_STEP  = GAME_CONFIG.hungerIncreasePerStep   ?? 5;
+const BOUNCE_MS        = GAME_CONFIG.bounceAnimationMs       ?? 350;
+const PARTICLE_MS      = GAME_CONFIG.particleLifetimeMs      ?? 700;
+const DANCE_MS         = GAME_CONFIG.streakDanceMs           ?? 2000;
+const BONUS_TILES      = GAME_CONFIG.streakBonusTiles        ?? 5;
+const SCENE_UNLOCK     = GAME_CONFIG.sceneUnlockSteps        ?? [50, 100];
 
-/** 场景主题列表 */
-const SCENES = ['forest', 'beach', 'space'];
+// 音调序列（连续步数越多音调越高）
+const STEP_TONES = [523, 659, 784, 880, 1047]; // C5 E5 G5 A5 C6
 
-/** 角色定义 */
-const CHARACTERS = {
-  fox: { name: '狐狸', color: '#ff8c42', earColor: '#e6732e' },
-  rabbit: { name: '兔子', color: '#ffb3d9', earColor: '#ff8cc8' },
-  dino: { name: '恐龙', color: '#6bcb77', earColor: '#4aad5c' },
+// ─── 场景定义 ─────────────────────────────────────────────────
+const SCENE_BG = {
+  forest: { top: '#87CEEB', bottom: '#B0E0FF', ground: '#5CB85C' },
+  beach:  { top: '#87CEEB', bottom: '#B0E0FF', ground: '#F5DEB3' },
+  space:  { top: '#0a0a2e', bottom: '#1a1a4e', ground: '#2a2a5e' },
 };
 
-/** 场景主题瓷砖类型 */
-const SCENE_TILES = {
-  forest: ['🌸', '🍄', '🪨', '🌿', '🌻'],
-  beach: ['🐚', '⭐', '🪨', '🌊', '🦀'],
-  space: ['⭐', '🌙', '🪨', '🪐', '💫'],
+// ─── 场景瓷砖（补充决策 2） ────────────────────────────────────
+const TILE_DEFS = {
+  forest: [
+    { bg: '#5CB85C', draw: drawFlower  },
+    { bg: '#FFD93D', draw: drawStar    },
+    { bg: '#E84040', draw: drawMushroom },
+    { bg: '#8BC34A', draw: drawGrass   },
+  ],
+  beach: [
+    { bg: '#FF9800', draw: drawShell   },
+    { bg: '#FF6B8A', draw: drawCrab    },
+    { bg: '#FFCC02', draw: drawSun     },
+    { bg: '#29B6F6', draw: drawWave    },
+  ],
+  space: [
+    { bg: '#9C27B0', draw: drawPlanet  },
+    { bg: '#3F51B5', draw: drawRocket  },
+    { bg: '#1A237E', draw: drawMoon    },
+    { bg: '#00BCD4', draw: drawAlien   },
+  ],
 };
 
-/** 场景背景色 */
-const SCENE_COLORS = {
-  forest: { top: '#1a3a1a', bottom: '#2d5a27' },
-  beach: { top: '#1a3a4a', bottom: '#4a7a8a' },
-  space: { top: '#0a0a2e', bottom: '#1a1a4e' },
+// ─── 角色定义 ──────────────────────────────────────────────────
+const CHAR_DEFS = {
+  rabbit: { body: '#FFFFFF', ear: '#FFB6C1',   nose: '#FFB6C1'  },
+  fox:    { body: '#FF8C42', ear: '#FFFFFF',   nose: '#e66022'  },
+  dino:   { body: '#6BCB77', ear: '#4aad5c',   nose: '#4aad5c'  },
 };
 
-// ─── 陪伴之旅游戏类 ──────────────────────────────────────────
+function rand(min, max) { return min + Math.random() * (max - min); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeOut(t) { return 1 - (1 - t) * (1 - t); }
 
+// ─── 主类 ─────────────────────────────────────────────────────
 class CompanionJourney extends GameInterface {
-  /**
-   * @param {HTMLCanvasElement} canvas — 游戏画布
-   * @param {Object} soundEngine — SoundEngine 实例
-   */
   constructor(canvas, soundEngine) {
     super();
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
-    this.soundEngine = soundEngine;
+    this.ctx    = canvas.getContext('2d');
+    this.sound  = soundEngine;
 
-    // ── 角色状态 ──
-    this._character = 'fox';
-    this._characterDef = CHARACTERS.fox;
+    // 从本地存储加载角色和场景
+    this._characterId = LocalStore.getCharacter() ?? 'rabbit';
+    this._char        = CHAR_DEFS[this._characterId] ?? CHAR_DEFS.rabbit;
+    this._scene       = this._computeScene();
+    this._totalAccum  = LocalStore.getTotalSteps() ?? 0;
 
-    // ── 场景状态 ──
-    this._currentScene = 'forest';
-    this._pathTiles = [];
-    this._scrollOffset = 0;
+    // 游戏状态
+    this._hunger      = 0;
+    this._streakCount = 0;
+    this._totalSteps  = 0;
+    this._isActive    = false;
+    this._isResting   = false;
 
-    // ── 游戏状态 ──
-    this.totalSteps = 0;
-    this.streakCount = 0;
-    this._hunger = 0;
-    this._lastStepTime = 0;
-    this._streakTimeoutId = null;
-    this._isActive = false;
-    this._isResting = false;
+    // 路径瓷砖（{ tileIdx, x }）
+    this._tiles       = [];
+    this._tileOffset  = 0;  // 瓷砖整体偏移（用于视差）
 
-    // ── 动画状态 ──
-    this._animations = {
-      bounce: null,
-      dance: null,
-      intro: null,
-      outro: null,
-    };
-    this._particles = [];
-    this._streakDots = [];
+    // 动画
+    this._bounceAnim   = null;   // { startTime, duration }
+    this._danceAnim    = null;   // { startTime, duration }
+    this._introAnim    = null;   // { startTime, phase: 'yawn'|'wave'|done }
+    this._outroAnim    = null;   // { startTime }
+    this._particles    = [];
+    this._streakFlash  = 0;      // 连续步数闪烁倒计时
+    this._breathPhase  = 0;
 
-    // ── 渲染 ──
-    this._rafId = null;
-    this._lastFrameTime = 0;
-    this._scale = 1;
-    this._breathPhase = 0;
-    this._totalAccumSteps = 0;
-    this._sceneUnlocked = null;
+    this._rafId       = null;
+    this._lastFrameT  = 0;
 
-    this._loadPersistedData();
+    // 云朵（装饰）
+    this._clouds = Array.from({ length: 4 }, () => ({
+      x: rand(0, 1), y: rand(0.05, 0.3), w: rand(0.08, 0.18), speed: rand(0.00005, 0.0001),
+    }));
   }
 
-  // ─── localStorage 持久化 ───────────────────────────────────
-
-  _loadPersistedData() {
-    try {
-      const character = localStorage.getItem('hrg.companion.character');
-      if (character && CHARACTERS[character]) {
-        this._character = character;
-        this._characterDef = CHARACTERS[character];
-      }
-      const steps = localStorage.getItem('hrg.progress.totalSteps');
-      this._totalAccumSteps = steps ? parseInt(steps, 10) || 0 : 0;
-      const scene = localStorage.getItem('hrg.progress.currentScene');
-      if (scene && SCENES.includes(scene)) this._currentScene = scene;
-    } catch (e) { /* 静默 */ }
-  }
-
-  _savePersistedData() {
-    try {
-      this._totalAccumSteps += this.totalSteps;
-      localStorage.setItem('hrg.progress.totalSteps', String(this._totalAccumSteps));
-      if (this._totalAccumSteps >= SCENE_UNLOCK_STEPS * 2
-        && this._totalAccumSteps - this.totalSteps < SCENE_UNLOCK_STEPS * 2) {
-        this._sceneUnlocked = 'space';
-        this._currentScene = 'space';
-      } else if (this._totalAccumSteps >= SCENE_UNLOCK_STEPS
-        && this._totalAccumSteps - this.totalSteps < SCENE_UNLOCK_STEPS) {
-        this._sceneUnlocked = 'beach';
-        this._currentScene = 'beach';
-      }
-      localStorage.setItem('hrg.progress.currentScene', this._currentScene);
-    } catch (e) { /* 静默 */ }
-  }
-
-  // ─── 生命周期 ──────────────────────────────────────────────
+  // ─── GameInterface 生命周期 ────────────────────────────────
 
   onSessionStart() {
-    this._ensureCanvasSize();
-    this._isActive = true;
-    this._isResting = false;
-    this.totalSteps = 0;
-    this.streakCount = 0;
-    this._hunger = 0;
-    this._particles = [];
-    this._pathTiles = [];
-    this._scrollOffset = 0;
-    this._streakDots = [];
-    this._sceneUnlocked = null;
-    for (let i = 0; i < 10; i++) this._addPathTile();
-    this._animations.intro = { phase: 'yawn', startTime: performance.now() };
-    this._startRenderLoop();
+    this._isActive    = true;
+    this._isResting   = false;
+    this._hunger      = 0;
+    this._streakCount = 0;
+    this._totalSteps  = 0;
+    this._tiles       = [];
+    this._tileOffset  = 0;
+    this._particles   = [];
+    this._bounceAnim  = null;
+    this._danceAnim   = null;
+    this._streakFlash = 0;
+    this._scene       = this._computeScene();
+    this._char        = CHAR_DEFS[this._characterId] ?? CHAR_DEFS.rabbit;
+    // 开场仪式：打哈欠→伸懒腰→挥手（3秒）
+    this._introAnim  = { startTime: performance.now(), duration: 3000 };
+    this._outroAnim  = null;
+    this._startLoop();
   }
 
   onStep(timestamp, side) {
     if (!this._isActive || this._isResting) return;
-    const now = timestamp || performance.now();
-    this.totalSteps++;
-    this.streakCount++;
-    this._lastStepTime = now;
-    this._updateStreakDots();
-    this._animations.bounce = { startTime: now, duration: BOUNCE_DURATION_MS };
-    this._emitParticles(now);
-    this._addPathTile();
+    const now = performance.now();
+
+    this._totalSteps++;
+    this._streakCount++;
+    this._totalAccum++;
     this._hunger = Math.min(100, this._hunger + HUNGER_PER_STEP);
-    if (this.soundEngine) this.soundEngine.playStepSound(this.streakCount);
-    if (this.streakCount > 0 && this.streakCount % STREAK_BONUS_AT === 0) {
-      this._triggerStreakBonus(now);
+
+    // 添加路径瓷砖
+    this._addTile(1);
+
+    // 弹跳动画
+    this._bounceAnim = { startTime: now, duration: BOUNCE_MS };
+
+    // 发射粒子
+    this._emitParticles(this.canvas.width / 2, this.canvas.height * 0.35, 8);
+
+    // 播放音效（连续步数决定音调）
+    this.sound?.playStepSound(this._streakCount);
+
+    // 连续步数奖励
+    if (this._streakCount % STREAK_BONUS_AT === 0) {
+      this._danceAnim  = { startTime: now, duration: DANCE_MS };
+      this._streakFlash = 800;
+      this._addTile(BONUS_TILES);
+      this.sound?.playCelebration();
+      // 额外粒子
+      this._emitParticles(this.canvas.width / 2, this.canvas.height * 0.35, 16, true);
     }
-    this._resetStreakTimeout();
-    this._scrollOffset += 40;
-    if (this._scrollOffset > 80) {
-      this._scrollOffset = 0;
-      this._pathTiles = this._pathTiles.filter(t => t.screenX > -120);
+
+    // 饥饿值满了：额外庆祝粒子
+    if (this._hunger >= 100) {
+      this._hunger = 0;
+      this._emitParticles(this.canvas.width / 2, this.canvas.height * 0.35, 20, true);
+      this.sound?.playCelebration();
+    }
+
+    // 检查场景解锁
+    const unlocked = this._checkSceneUnlock();
+    if (unlocked) {
+      this._scene = unlocked;
+      LocalStore.saveScene(unlocked);
     }
   }
 
   onRestStart() {
-    this._isResting = true;
-    if (this._streakTimeoutId) { clearTimeout(this._streakTimeoutId); this._streakTimeoutId = null; }
+    this._isResting   = true;
+    this._bounceAnim  = null;
+    this._danceAnim   = null;
   }
 
   onRestEnd() {
-    this._isResting = false;
-    this._resetStreakTimeout();
+    this._isResting   = false;
   }
 
   onSessionEnd() {
-    this._isActive = false;
-    this._animations.outro = { phase: 'celebrate', startTime: performance.now() };
-    this._savePersistedData();
-    if (this._streakTimeoutId) { clearTimeout(this._streakTimeoutId); this._streakTimeoutId = null; }
-    return { totalSteps: this.totalSteps, streakCount: this.streakCount };
+    this._isActive   = false;
+    this._isResting  = false;
+    this._outroAnim  = { startTime: performance.now(), duration: 3000 };
+    // 保存累计步数
+    LocalStore.addTotalSteps(this._totalSteps);
   }
 
-  getStreakCount() { return this.streakCount; }
-  getCanvas() { return this.canvas; }
+  getStreakCount() { return this._streakCount; }
+  getCanvas()      { return this.canvas; }
 
   destroy() {
-    this._stopRenderLoop();
-    this._particles = [];
-    this._pathTiles = [];
     this._isActive = false;
-    if (this._streakTimeoutId) clearTimeout(this._streakTimeoutId);
+    if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = null; }
   }
 
-  // ─── 连续步数 ──────────────────────────────────────────────
+  // ─── 渲染循环 ─────────────────────────────────────────────
 
-  _updateStreakDots() {
-    const filled = this.streakCount % STREAK_BONUS_AT;
-    this._streakDots = [];
-    for (let i = 0; i < STREAK_BONUS_AT; i++) {
-      this._streakDots.push({ filled: i < filled, flashing: false });
+  _startLoop() {
+    const loop = (now) => {
+      const keepGoing = this._isActive || !!this._outroAnim;
+      if (!keepGoing && !this._particles.length && !this._pops?.length) return;
+      this._rafId = requestAnimationFrame(loop);
+      const dt = Math.min(now - this._lastFrameT, 50);
+      this._lastFrameT = now;
+      this._update(dt, now);
+      this._draw(now);
+    };
+    this._lastFrameT = performance.now();
+    this._rafId = requestAnimationFrame(loop);
+  }
+
+  _update(dt, now) {
+    this._breathPhase += dt * 0.002;
+
+    // 云移动
+    for (const c of this._clouds) {
+      c.x += c.speed * dt;
+      if (c.x > 1.2) c.x = -c.w;
+    }
+
+    // 粒子
+    this._particles = this._particles.filter(p => {
+      p.x  += p.vx * dt * 0.06;
+      p.y  += p.vy * dt * 0.06;
+      p.vy += 0.06;
+      p.life -= dt;
+      return p.life > 0;
+    });
+
+    // 连续步数闪烁倒计时
+    if (this._streakFlash > 0) this._streakFlash -= dt;
+
+    // 出场动画结束时停止循环
+    if (this._outroAnim) {
+      const elapsed = now - this._outroAnim.startTime;
+      if (elapsed > this._outroAnim.duration + 500 && !this._particles.length) {
+        this._outroAnim = null;
+        if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = null; }
+      }
     }
   }
 
-  _triggerStreakBonus(now) {
-    this._streakDots = this._streakDots.map(() => ({ filled: true, flashing: true }));
-    this._animations.dance = { startTime: now, duration: STREAK_DANCE_MS };
-    if (this.soundEngine) this.soundEngine.playCelebration();
-    for (let i = 0; i < BONUS_TILES; i++) this._addPathTile();
-  }
+  _draw(now) {
+    const ctx = this.ctx;
+    const W = this.canvas.width, H = this.canvas.height;
+    const sc = SCENE_BG[this._scene] ?? SCENE_BG.forest;
 
-  _resetStreakTimeout() {
-    if (this._streakTimeoutId) clearTimeout(this._streakTimeoutId);
-    this._streakTimeoutId = setTimeout(() => {
-      this.streakCount = 0;
-      this._streakDots = [];
-      this._streakTimeoutId = null;
-    }, STREAK_TIMEOUT_MS);
-  }
+    // ── 背景天空 ──
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, sc.top);
+    sky.addColorStop(0.75, sc.bottom);
+    sky.addColorStop(1, sc.ground);
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
 
-  // ─── 路径瓷砖 ──────────────────────────────────────────────
+    // ── 云朵（太空场景不显示） ──
+    if (this._scene !== 'space') {
+      for (const c of this._clouds) {
+        this._drawCloud(ctx, c.x * W, c.y * H, c.w * W);
+      }
+    } else {
+      // 太空：画几颗星星
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      for (let i = 0; i < 30; i++) {
+        const sx = ((i * 137.5 + 17) % 1) * W;
+        const sy = ((i * 0.618) % 0.7) * H;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 1.5 + (i % 3), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
 
-  _addPathTile() {
-    const tiles = SCENE_TILES[this._currentScene] || SCENE_TILES.forest;
-    const emoji = tiles[Math.floor(Math.random() * tiles.length)];
-    this._pathTiles.push({
-      emoji,
-      screenX: this.canvas.width * 0.15 + this._pathTiles.length * 60,
-      baseY: this.canvas.height * 0.78 + Math.random() * 20,
-      size: 24 + Math.random() * 8,
+    // ── 地面与路径瓷砖 ──
+    const groundY = H * 0.78;
+    ctx.fillStyle = sc.ground;
+    ctx.fillRect(0, groundY, W, H - groundY);
+    this._drawTiles(ctx, W, H, groundY);
+
+    // ── 粒子 ──
+    for (const p of this._particles) {
+      const alpha = Math.max(0, p.life / p.maxLife);
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fillStyle = p.color;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // ── 角色 ──
+    const charCX = W / 2;
+    const charCY = groundY - 20;
+    let charScale = 1;
+
+    const introT = this._introAnim
+      ? Math.min(1, (now - this._introAnim.startTime) / this._introAnim.duration)
+      : 1;
+    const bounceT = this._bounceAnim
+      ? Math.min(1, (now - this._bounceAnim.startTime) / this._bounceAnim.duration)
+      : 0;
+    const danceT = this._danceAnim
+      ? Math.min(1, (now - this._danceAnim.startTime) / this._danceAnim.duration)
+      : 0;
+    const outroT = this._outroAnim
+      ? Math.min(1, (now - this._outroAnim.startTime) / this._outroAnim.duration)
+      : 0;
+
+    // 弹跳：scale 1→1.15→1
+    const bounceScale = bounceT > 0
+      ? 1 + 0.15 * Math.sin(bounceT * Math.PI)
+      : 1;
+    // 呼吸
+    const breathScale = 1 + Math.sin(this._breathPhase) * 0.015;
+    // 舞蹈（上下跳动）
+    const danceOffY = danceT > 0 && danceT < 1
+      ? -30 * Math.abs(Math.sin(danceT * Math.PI * 4))
+      : 0;
+    // 收尾（入睡：缓慢蹲下）
+    const outroScale = outroT > 0.5 ? lerp(1, 0.75, easeOut((outroT - 0.5) * 2)) : 1;
+
+    charScale = bounceScale * breathScale * outroScale;
+
+    // 开场：从底部弹入
+    const introOffY = introT < 1 ? (1 - easeOut(introT)) * 80 : 0;
+
+    this._drawCharacter(ctx, charCX, charCY + introOffY + danceOffY, charScale, {
+      isResting:  this._isResting,
+      isDancing:  danceT > 0 && danceT < 1,
+      isSleeping: outroT > 0.7,
+      bounceT,
     });
+
+    if (this._bounceAnim && now - this._bounceAnim.startTime > BOUNCE_MS) {
+      this._bounceAnim = null;
+    }
+    if (this._danceAnim && now - this._danceAnim.startTime > DANCE_MS) {
+      this._danceAnim = null;
+    }
+    if (this._introAnim && introT >= 1) {
+      this._introAnim = null;
+    }
+
+    // ── HUD ──
+    this._drawHUD(ctx, W, H);
   }
 
-  // ─── 粒子 ──────────────────────────────────────────────────
+  // ─── 绘制角色 ─────────────────────────────────────────────
 
-  _emitParticles(now) {
-    const cx = this.canvas.width * 0.3;
-    const cy = this.canvas.height * 0.52;
-    const cols = ['#ff6b9d', '#ff8c42', '#ffd93d', '#6bcb77', '#4d96ff', '#b388ff', '#ff6b9d', '#ff8c42'];
-    for (let i = 0; i < 8; i++) {
-      const angle = (Math.PI * 2 * i) / 8 + (Math.random() - 0.5) * 0.4;
-      const speed = 2 + Math.random() * 3;
+  _drawCharacter(ctx, cx, cy, scale, state) {
+    const s     = scale * Math.min(this.canvas.width, this.canvas.height) * 0.00065;
+    const char  = this._char;
+    const { isResting, isDancing, isSleeping, bounceT } = state;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(s, s);
+
+    // 身体
+    ctx.beginPath();
+    ctx.ellipse(0, 30, 42, 55, 0, 0, Math.PI * 2);
+    ctx.fillStyle = char.body;
+    ctx.fill();
+    ctx.strokeStyle = '#111';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // 耳朵（兔子：长耳；狐狸：三角耳；恐龙：头顶鳍）
+    if (this._characterId === 'rabbit') {
+      this._drawRabbitEars(ctx, char);
+    } else if (this._characterId === 'fox') {
+      this._drawFoxEars(ctx, char);
+    } else {
+      this._drawDinoFin(ctx, char);
+    }
+
+    // 头部
+    ctx.beginPath();
+    ctx.ellipse(0, -32, 38, 36, 0, 0, Math.PI * 2);
+    ctx.fillStyle = char.body;
+    ctx.fill();
+    ctx.strokeStyle = '#111';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // 表情
+    if (isSleeping || isResting) {
+      this._drawFaceSleep(ctx);
+    } else if (isDancing || bounceT > 0) {
+      this._drawFaceHappy(ctx);
+    } else {
+      this._drawFaceNormal(ctx);
+    }
+
+    // 手臂
+    this._drawArms(ctx, char, isDancing, bounceT);
+
+    ctx.restore();
+  }
+
+  _drawRabbitEars(ctx, char) {
+    for (const side of [-1, 1]) {
+      const tilt = side * 0.2;
+      ctx.save();
+      ctx.translate(side * 20, -70);
+      ctx.rotate(tilt);
+      ctx.beginPath(); ctx.ellipse(0, 0, 10, 32, 0, 0, Math.PI * 2);
+      ctx.fillStyle = char.body; ctx.fill();
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(0, 2, 5, 20, 0, 0, Math.PI * 2);
+      ctx.fillStyle = char.ear; ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  _drawFoxEars(ctx, char) {
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(side * 28, -62);
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.lineTo(side * 18, -28); ctx.lineTo(side * 0, -24);
+      ctx.closePath();
+      ctx.fillStyle = char.body; ctx.fill();
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 2.5; ctx.stroke();
+      // 黑色耳尖
+      ctx.beginPath();
+      ctx.moveTo(0, -10); ctx.lineTo(side * 18, -28); ctx.lineTo(side * 12, -16);
+      ctx.closePath();
+      ctx.fillStyle = '#222'; ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  _drawDinoFin(ctx, char) {
+    // 头顶三角鳍
+    const pts = [[-20, -65], [-8, -90], [0, -75], [8, -95], [20, -70]];
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (const [px, py] of pts.slice(1)) ctx.lineTo(px, py);
+    ctx.closePath();
+    ctx.fillStyle = char.ear; ctx.fill();
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  _drawFaceNormal(ctx) {
+    // 眼睛（大圆眼 + 双高光）
+    for (const side of [-1, 1]) {
+      const ex = side * 14;
+      ctx.beginPath(); ctx.arc(ex, -36, 11, 0, Math.PI * 2);
+      ctx.fillStyle = '#333'; ctx.fill();
+      ctx.beginPath(); ctx.arc(ex + side * 2, -39, 4, 0, Math.PI * 2);
+      ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.beginPath(); ctx.arc(ex + side * 4, -40, 2, 0, Math.PI * 2);
+      ctx.fillStyle = '#fff'; ctx.fill();
+    }
+    // 鼻子
+    ctx.beginPath(); ctx.arc(0, -26, 5, 0, Math.PI * 2);
+    ctx.fillStyle = this._char.nose; ctx.fill();
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+    // 嘴
+    ctx.beginPath(); ctx.arc(0, -20, 10, 0.15, Math.PI - 0.15);
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 2.5; ctx.stroke();
+  }
+
+  _drawFaceHappy(ctx) {
+    // 眯眼（弯月）
+    for (const side of [-1, 1]) {
+      const ex = side * 14;
+      ctx.beginPath(); ctx.arc(ex, -36, 11, Math.PI, 0);
+      ctx.strokeStyle = '#333'; ctx.lineWidth = 3; ctx.stroke();
+    }
+    // 大张嘴露小牙
+    ctx.beginPath(); ctx.arc(0, -22, 12, 0.2, Math.PI - 0.2);
+    ctx.fillStyle = '#e05050'; ctx.fill();
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 2.5; ctx.stroke();
+    // 两颗小牙
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(-7, -26, 5, 8);
+    ctx.fillRect(2, -26, 5, 8);
+  }
+
+  _drawFaceSleep(ctx) {
+    // 半闭眼（横线）
+    for (const side of [-1, 1]) {
+      const ex = side * 14;
+      ctx.beginPath();
+      ctx.moveTo(ex - 8, -36); ctx.lineTo(ex + 8, -36);
+      ctx.strokeStyle = '#333'; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.stroke();
+      // 下眼皮弧
+      ctx.beginPath(); ctx.arc(ex, -36, 8, 0, Math.PI);
+      ctx.strokeStyle = '#aaa'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    // 安静小嘴
+    ctx.beginPath(); ctx.arc(0, -22, 5, 0.3, Math.PI - 0.3);
+    ctx.strokeStyle = '#aaa'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  _drawArms(ctx, char, isDancing, bounceT) {
+    const armAngle = isDancing ? Math.sin(performance.now() * 0.01) * 0.8 : (bounceT > 0 ? -0.5 : 0.3);
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(side * 36, 5);
+      ctx.rotate(side * armAngle);
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.quadraticCurveTo(side * 20, 5, side * 30, -10);
+      ctx.lineWidth   = 16;
+      ctx.lineCap     = 'round';
+      ctx.strokeStyle = char.body; ctx.stroke();
+      ctx.lineWidth   = 3;
+      ctx.strokeStyle = '#111'; ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // ─── 绘制辅助 ─────────────────────────────────────────────
+
+  _drawCloud(ctx, x, y, w) {
+    const h = w * 0.45;
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.ellipse(x, y, w * 0.5, h * 0.5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x + w * 0.28, y + h * 0.1, w * 0.3, h * 0.4, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x - w * 0.28, y + h * 0.1, w * 0.28, h * 0.38, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  _drawTiles(ctx, W, H, groundY) {
+    const tileSize = Math.round(H * 0.075);
+    const y = groundY + (H - groundY - tileSize) / 2;
+
+    for (let i = 0; i < this._tiles.length; i++) {
+      const t   = this._tiles[i];
+      const x   = t.x + this._tileOffset;
+      if (x + tileSize < 0 || x > W) continue;
+      const def = TILE_DEFS[this._scene]?.[t.tileIdx % (TILE_DEFS[this._scene]?.length ?? 4)];
+      if (!def) continue;
+      drawTile(ctx, x, y, tileSize, def);
+    }
+
+    // 裁剪过远的瓷砖（优化性能）
+    this._tiles = this._tiles.filter(t => t.x + this._tileOffset > -tileSize * 2);
+  }
+
+  _drawHUD(ctx, W, H) {
+    // 饥饿值进度条
+    const barW = Math.round(W * 0.18);
+    const barH = 18;
+    const barX = 20;
+    const barY = 20;
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW, barH, 9);
+    ctx.fill();
+    const pct = this._hunger / 100;
+    const fillColors = ['#FF6B6B', '#FFD93D', '#6BCB77'];
+    const ci = Math.floor(pct * 2.99);
+    ctx.fillStyle = fillColors[ci] ?? '#6BCB77';
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW * pct, barH, 9);
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW, barH, 9);
+    ctx.stroke();
+
+    // 心形图标
+    ctx.font = `${Math.round(H * 0.03)}px sans-serif`;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.fillText('❤️', barX + barW + 6, barY + barH - 1);
+
+    // 连续步数进度点（右上角）
+    const n = STREAK_BONUS_AT;
+    const pos = this._streakCount % n;
+    const flash = this._streakFlash > 0;
+    const dotR = Math.round(H * 0.022);
+    const gap  = dotR * 2.8;
+    const startX = W - (n * gap) - 20;
+    const dotY   = 30;
+
+    for (let i = 0; i < n; i++) {
+      const filled = i < pos || (flash && pos === 0);
+      const cx = startX + i * gap + dotR;
+      ctx.beginPath();
+      ctx.arc(cx, dotY, dotR, 0, Math.PI * 2);
+      ctx.fillStyle = filled ? '#FFD93D' : 'rgba(255,255,255,0.25)';
+      ctx.fill();
+      ctx.strokeStyle = filled ? '#e6a800' : 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // 步数文字
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = `bold ${Math.round(H * 0.042)}px sans-serif`;
+    ctx.textAlign = 'right';
+    if (this._totalSteps > 0) {
+      ctx.fillText(`${this._totalSteps} 步`, W - 20, 55);
+    }
+  }
+
+  // ─── 游戏逻辑 ─────────────────────────────────────────────
+
+  _addTile(count) {
+    const W = this.canvas.width;
+    const tileSize = Math.round(this.canvas.height * 0.075);
+    const defs = TILE_DEFS[this._scene] ?? TILE_DEFS.forest;
+    let lastX = this._tiles.length
+      ? Math.max(...this._tiles.map(t => t.x)) + tileSize + 4
+      : W * 0.6;
+
+    for (let i = 0; i < count; i++) {
+      this._tiles.push({
+        tileIdx: Math.floor(Math.random() * defs.length),
+        x: lastX + i * (tileSize + 4),
+      });
+    }
+
+    // 缓慢向左滚动
+    this._tileOffset -= tileSize * 0.6;
+  }
+
+  _emitParticles(x, y, count, big = false) {
+    const colors = ['#FF6B9D', '#FFD93D', '#6BCB77', '#4D96FF', '#FF8C42', '#B388FF'];
+    for (let i = 0; i < count; i++) {
+      const angle = rand(-Math.PI, Math.PI);
+      const speed = rand(big ? 4 : 2, big ? 10 : 6);
+      const life  = PARTICLE_MS * rand(0.6, 1.0);
       this._particles.push({
-        x: cx, y: cy,
+        x, y,
         vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed - 1,
-        size: 4 + Math.random() * 6,
-        color: cols[i % cols.length],
-        alpha: 1,
-        alphaDecay: 1 / (PARTICLE_LIFETIME_MS / 16),
-        startTime: now,
+        vy: Math.sin(angle) * speed - 2,
+        r:  rand(big ? 5 : 3, big ? 10 : 6),
+        color: colors[Math.floor(Math.random() * colors.length)],
+        life,
+        maxLife: life,
       });
     }
   }
 
-  // ─── 渲染循环 ──────────────────────────────────────────────
-
-  _startRenderLoop() {
-    if (this._rafId) return;
-    this._lastFrameTime = performance.now();
-    const loop = (ts) => {
-      if (!this._isActive && !this._animations.outro) return;
-      this._renderLoop(ts);
-      this._rafId = requestAnimationFrame(loop);
-    };
-    this._rafId = requestAnimationFrame(loop);
+  _computeScene() {
+    const total = LocalStore.getTotalSteps() ?? 0;
+    const thresholds = Array.isArray(SCENE_UNLOCK) ? SCENE_UNLOCK : [50, 100];
+    if (total >= (thresholds[1] ?? 100)) return 'space';
+    if (total >= (thresholds[0] ?? 50))  return 'beach';
+    return 'forest';
   }
 
-  _stopRenderLoop() {
-    if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = null; }
+  _checkSceneUnlock() {
+    const thresholds = Array.isArray(SCENE_UNLOCK) ? SCENE_UNLOCK : [50, 100];
+    if (this._totalAccum >= (thresholds[1] ?? 100) && this._scene !== 'space') return 'space';
+    if (this._totalAccum >= (thresholds[0] ?? 50)  && this._scene === 'forest') return 'beach';
+    return null;
   }
+}
 
-  _renderLoop(timestamp) {
-    const ctx = this.ctx;
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    this._lastFrameTime = timestamp;
-    this._drawBackground(ctx, w, h);
-    this._drawPathTiles(ctx);
-    this._drawCharacter(ctx, timestamp);
-    this._drawParticles(ctx);
-    this._drawStreakDots(ctx, w, h);
-    this._drawHungerBar(ctx, w);
-    if (this._animations.outro) this._drawOutro(ctx, w, h, timestamp);
+// ─── 瓷砖绘制工具函数 ────────────────────────────────────────
+
+function drawTile(ctx, x, y, size, def) {
+  const r = Math.round(size * 0.18);
+  // 底色
+  ctx.beginPath();
+  ctx.roundRect(x, y, size, size, r);
+  ctx.fillStyle = def.bg;
+  ctx.fill();
+  ctx.strokeStyle = '#111';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  // 图标
+  const cx = x + size / 2, cy = y + size / 2;
+  ctx.save();
+  def.draw(ctx, cx, cy, size * 0.5);
+  ctx.restore();
+}
+
+function drawFlower(ctx, cx, cy, s) {
+  const petals = 5;
+  for (let i = 0; i < petals; i++) {
+    const a = (i / petals) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(a) * s * 0.42, cy + Math.sin(a) * s * 0.42, s * 0.28, 0, Math.PI * 2);
+    ctx.fillStyle = '#FF9EB5'; ctx.fill();
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
   }
+  ctx.beginPath(); ctx.arc(cx, cy, s * 0.24, 0, Math.PI * 2);
+  ctx.fillStyle = '#FFD93D'; ctx.fill();
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+}
 
-  // ─── 背景 ──────────────────────────────────────────────────
-
-  _drawBackground(ctx, w, h) {
-    const c = SCENE_COLORS[this._currentScene] || SCENE_COLORS.forest;
-    const bg = ctx.createLinearGradient(0, 0, 0, h);
-    bg.addColorStop(0, c.top); bg.addColorStop(1, c.bottom);
-    ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h);
-
-    if (this._currentScene === 'forest') this._drawForestBG(ctx, w, h);
-    else if (this._currentScene === 'beach') this._drawBeachBG(ctx, w, h);
-    else if (this._currentScene === 'space') this._drawSpaceBG(ctx, w, h);
-
-    ctx.fillStyle = this._currentScene === 'space' ? 'rgba(20,20,60,0.8)' : 'rgba(40,80,40,0.6)';
-    ctx.fillRect(0, h * 0.82, w, h * 0.18);
+function drawStar(ctx, cx, cy, s) {
+  ctx.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2 - Math.PI / 2;
+    const b = a + Math.PI / 5;
+    ctx.lineTo(cx + Math.cos(a) * s * 0.9, cy + Math.sin(a) * s * 0.9);
+    ctx.lineTo(cx + Math.cos(b) * s * 0.4, cy + Math.sin(b) * s * 0.4);
   }
+  ctx.closePath();
+  ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+}
 
-  _drawForestBG(ctx, w, h) {
-    ctx.fillStyle = 'rgba(30,60,30,0.3)';
-    for (let i = 0; i < 5; i++) {
-      const tx = w * 0.1 + i * w * 0.2, th = h * 0.4 + Math.sin(i * 2) * 30;
-      ctx.beginPath(); ctx.moveTo(tx - 40, h * 0.82); ctx.lineTo(tx, th); ctx.lineTo(tx + 40, h * 0.82); ctx.fill();
-    }
-    ctx.fillStyle = 'rgba(255,255,255,0.1)';
-    for (let i = 0; i < 3; i++) {
-      const cx = w * 0.2 + i * w * 0.35, cy = h * 0.15 + Math.sin(i) * 20;
-      ctx.beginPath(); ctx.arc(cx, cy, 30, 0, Math.PI * 2); ctx.arc(cx + 25, cy - 10, 25, 0, Math.PI * 2); ctx.arc(cx - 20, cy + 5, 20, 0, Math.PI * 2); ctx.fill();
-    }
+function drawMushroom(ctx, cx, cy, s) {
+  // 帽子
+  ctx.beginPath(); ctx.arc(cx, cy - s * 0.1, s * 0.7, Math.PI, 0); ctx.closePath();
+  ctx.fillStyle = '#E84040'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  // 白点
+  for (const [dx, dy] of [[-0.28, -0.3], [0.22, -0.45], [0, -0.1]]) {
+    ctx.beginPath(); ctx.arc(cx + dx * s, cy + dy * s, s * 0.13, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff'; ctx.fill();
   }
+  // 柄
+  ctx.beginPath(); ctx.rect(cx - s * 0.2, cy - s * 0.1, s * 0.4, s * 0.55);
+  ctx.fillStyle = '#F5DEB3'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+}
 
-  _drawBeachBG(ctx, w, h) {
-    ctx.strokeStyle = 'rgba(100,180,220,0.3)'; ctx.lineWidth = 2;
-    for (let i = 0; i < 4; i++) {
-      const by = h * 0.25 + i * 20;
-      ctx.beginPath(); ctx.moveTo(0, by);
-      for (let x = 0; x < w; x += 20) ctx.lineTo(x, by + Math.sin(x * 0.02 + i) * 8);
-      ctx.stroke();
-    }
-    ctx.fillStyle = 'rgba(200,180,140,0.15)';
-    for (let i = 0; i < 15; i++) { ctx.beginPath(); ctx.arc(Math.random() * w, h * 0.78 + Math.random() * h * 0.22, 1.5, 0, Math.PI * 2); ctx.fill(); }
+function drawGrass(ctx, cx, cy, s) {
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  for (const [dx, dy] of [[-0.3, 0.3], [0, -0.1], [0.3, 0.3]]) {
+    ctx.beginPath();
+    ctx.moveTo(cx + dx * s, cy + 0.4 * s);
+    ctx.quadraticCurveTo(cx + dx * s * 1.1, cy + dy * s, cx + dx * s, cy - 0.4 * s + dy * s);
+    ctx.stroke();
   }
+}
 
-  _drawSpaceBG(ctx, w, h) {
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
-    for (let i = 0; i < 40; i++) {
-      const sx = (i * 137 + 31) % w, sy = (i * 73 + 17) % (h * 0.7), ss = 1 + (i % 3);
-      ctx.beginPath(); ctx.arc(sx, sy, ss, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.fillStyle = 'rgba(160,100,255,0.15)'; ctx.beginPath(); ctx.arc(w * 0.85, h * 0.15, 50, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = 'rgba(255,150,100,0.1)'; ctx.beginPath(); ctx.arc(w * 0.75, h * 0.3, 30, 0, Math.PI * 2); ctx.fill();
+function drawShell(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.arc(cx, cy, s * 0.7, Math.PI, 0); ctx.closePath();
+  ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  for (let i = 0; i < 5; i++) {
+    const a = Math.PI + (i / 4) * Math.PI;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * s * 0.7, cy + Math.sin(a) * s * 0.7);
+    ctx.strokeStyle = '#ddd'; ctx.lineWidth = 1; ctx.stroke();
   }
+}
 
-  // ─── 路径瓷砖 ──────────────────────────────────────────────
-
-  _drawPathTiles(ctx) {
-    const w = this.canvas.width;
-    for (const tile of this._pathTiles) {
-      const x = tile.screenX - this._scrollOffset;
-      if (x < -60 || x > w + 60) continue;
-      ctx.save();
-      ctx.font = `${tile.size}px "PingFang SC", sans-serif`;
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(tile.emoji, x, tile.baseY);
-      ctx.restore();
-    }
-    if (this._scrollOffset > 0 && !this._isResting) {
-      this._scrollOffset *= 0.95;
-      if (this._scrollOffset < 0.1) this._scrollOffset = 0;
-    }
+function drawCrab(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.ellipse(cx, cy, s * 0.55, s * 0.38, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#FF6B8A'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  // 钳子
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(cx + side * s * 0.8, cy, s * 0.22, 0, Math.PI * 2);
+    ctx.strokeStyle = '#FF6B8A'; ctx.lineWidth = 6; ctx.stroke();
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
   }
-
-  // ─── 角色绘制 ──────────────────────────────────────────────
-
-  _drawCharacter(ctx, timestamp) {
-    const cx = this.canvas.width * 0.3;
-    const cy = this.canvas.height * 0.52;
-    let scale = 1.0;
-    let offsetY = 0;
-
-    // 开场仪式
-    if (this._animations.intro) {
-      const intro = this._animations.intro;
-      const elapsed = timestamp - intro.startTime;
-      if (intro.phase === 'yawn' && elapsed < 1000) {
-        offsetY = Math.sin(elapsed / 1000 * Math.PI) * -5;
-      } else if (intro.phase === 'yawn') {
-        intro.phase = 'stretch'; intro.startTime = timestamp;
-      } else if (intro.phase === 'stretch' && elapsed < 1000) {
-        scale = 1.0 + Math.sin(elapsed / 1000 * Math.PI) * 0.08;
-      } else if (intro.phase === 'stretch') {
-        intro.phase = 'wave'; intro.startTime = timestamp;
-      } else if (intro.phase === 'wave' && elapsed >= 1000) {
-        this._animations.intro = null;
-      }
-    }
-
-    // 弹跳动画
-    if (this._animations.bounce) {
-      const b = this._animations.bounce;
-      const elapsed = timestamp - b.startTime;
-      if (elapsed < b.duration) {
-        scale += Math.sin((elapsed / b.duration) * Math.PI) * 0.15;
-      } else { this._animations.bounce = null; }
-    }
-
-    // 舞蹈动画（旋转 + 弹跳，直接在本函数内处理）
-    if (this._animations.dance) {
-      const d = this._animations.dance;
-      const elapsed = timestamp - d.startTime;
-      if (elapsed < d.duration) {
-        const progress = elapsed / d.duration;
-        scale += Math.sin(progress * Math.PI * 4) * 0.1;
-        const rotation = Math.sin(progress * Math.PI * 4) * 0.15;
-        ctx.save(); ctx.translate(cx, cy + offsetY); ctx.rotate(rotation); ctx.scale(scale, scale);
-        this._drawCharacterBody(ctx, 0, 0, timestamp); ctx.restore();
-        return;
-      } else { this._animations.dance = null; }
-    }
-
-    // 呼吸
-    if (!this._animations.bounce && !this._animations.dance) {
-      this._breathPhase += 0.03;
-      scale += Math.sin(this._breathPhase) * 0.02;
-    }
-
-    ctx.save(); ctx.translate(cx, cy + offsetY); ctx.scale(scale, scale);
-    this._drawCharacterBody(ctx, 0, 0, timestamp);
-
-    // 挥手
-    if (this._animations.intro && this._animations.intro.phase === 'wave') {
-      const we = timestamp - this._animations.intro.startTime;
-      ctx.save(); ctx.translate(30, -40); ctx.rotate(Math.sin(we * 0.015) * 0.4);
-      ctx.fillStyle = this._characterDef.color;
-      ctx.beginPath(); ctx.ellipse(0, 0, 12, 8, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-    }
-    ctx.restore();
+  // 眼睛
+  for (const side of [-1, 1]) {
+    ctx.beginPath(); ctx.arc(cx + side * s * 0.22, cy - s * 0.22, s * 0.1, 0, Math.PI * 2);
+    ctx.fillStyle = '#111'; ctx.fill();
   }
+}
 
-  _drawCharacterBody(ctx, x, y, timestamp) {
-    if (this._character === 'fox') this._drawFox(ctx, x, y);
-    else if (this._character === 'rabbit') this._drawRabbit(ctx, x, y);
-    else if (this._character === 'dino') this._drawDino(ctx, x, y);
-    if (!this._animations.bounce && !this._animations.dance) this._drawTail(ctx, x, y, timestamp);
+function drawSun(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.arc(cx, cy, s * 0.42, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * s * 0.52, cy + Math.sin(a) * s * 0.52);
+    ctx.lineTo(cx + Math.cos(a) * s * 0.9, cy + Math.sin(a) * s * 0.9);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.stroke();
   }
+}
 
-  _drawFox(ctx, x, y) {
-    // 身体
-    ctx.fillStyle = '#ff8c42';
-    ctx.beginPath(); ctx.ellipse(x, y + 10, 35, 40, 0, 0, Math.PI * 2); ctx.fill();
-    // 肚皮
-    ctx.fillStyle = '#ffe0c0';
-    ctx.beginPath(); ctx.ellipse(x, y + 15, 22, 28, 0, 0, Math.PI * 2); ctx.fill();
-    // 头
-    ctx.fillStyle = '#ff8c42';
-    ctx.beginPath(); ctx.arc(x, y - 25, 22, 0, Math.PI * 2); ctx.fill();
-    // 尖脸
-    ctx.fillStyle = '#ffe0c0';
-    ctx.beginPath(); ctx.moveTo(x - 12, y - 30); ctx.lineTo(x, y - 5); ctx.lineTo(x + 12, y - 30); ctx.closePath(); ctx.fill();
-    // 耳朵
-    ctx.fillStyle = '#ff8c42';
-    ctx.beginPath(); ctx.moveTo(x - 12, y - 42); ctx.lineTo(x - 6, y - 70); ctx.lineTo(x + 8, y - 42); ctx.closePath(); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(x - 8, y - 42); ctx.lineTo(x + 6, y - 70); ctx.lineTo(x + 12, y - 42); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = '#ffb380';
-    ctx.beginPath(); ctx.moveTo(x - 9, y - 44); ctx.lineTo(x - 5, y - 60); ctx.lineTo(x + 4, y - 44); ctx.closePath(); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(x - 4, y - 44); ctx.lineTo(x + 5, y - 60); ctx.lineTo(x + 9, y - 44); ctx.closePath(); ctx.fill();
-    // 眼睛
-    ctx.fillStyle = '#2d1b69';
-    ctx.beginPath(); ctx.arc(x - 8, y - 28, 4, 0, Math.PI * 2); ctx.arc(x + 8, y - 28, 4, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.beginPath(); ctx.arc(x - 7, y - 29, 1.5, 0, Math.PI * 2); ctx.arc(x + 9, y - 29, 1.5, 0, Math.PI * 2); ctx.fill();
-    // 鼻子
-    ctx.fillStyle = '#2d1b69';
-    ctx.beginPath(); ctx.ellipse(x, y - 20, 4, 3, 0, 0, Math.PI * 2); ctx.fill();
-    // 嘴
-    ctx.strokeStyle = '#2d1b69'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(x, y - 16, 6, 0.1 * Math.PI, 0.9 * Math.PI); ctx.stroke();
-    // 脚
-    ctx.fillStyle = '#e6732e';
-    ctx.beginPath(); ctx.ellipse(x - 14, y + 45, 12, 7, 0, 0, Math.PI * 2); ctx.ellipse(x + 14, y + 45, 12, 7, 0, 0, Math.PI * 2); ctx.fill();
+function drawWave(ctx, cx, cy, s) {
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  for (const oy of [-s * 0.15, s * 0.15]) {
+    ctx.beginPath();
+    ctx.moveTo(cx - s * 0.7, cy + oy);
+    ctx.bezierCurveTo(cx - s * 0.3, cy + oy - s * 0.3, cx + s * 0.3, cy + oy + s * 0.3, cx + s * 0.7, cy + oy);
+    ctx.stroke();
   }
+}
 
-  _drawRabbit(ctx, x, y) {
-    ctx.fillStyle = '#ffb3d9';
-    ctx.beginPath(); ctx.ellipse(x, y + 8, 32, 38, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffe0f0';
-    ctx.beginPath(); ctx.ellipse(x, y + 12, 20, 26, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffb3d9';
-    ctx.beginPath(); ctx.arc(x, y - 22, 24, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffb3d9';
-    ctx.beginPath(); ctx.ellipse(x - 8, y - 68, 8, 25, -0.2, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.ellipse(x + 8, y - 68, 8, 25, 0.2, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffd9e9';
-    ctx.beginPath(); ctx.ellipse(x - 8, y - 66, 4, 18, -0.2, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.ellipse(x + 8, y - 66, 4, 18, 0.2, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#2d1b69';
-    ctx.beginPath(); ctx.arc(x - 9, y - 24, 4.5, 0, Math.PI * 2); ctx.arc(x + 9, y - 24, 4.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.beginPath(); ctx.arc(x - 8, y - 25, 1.5, 0, Math.PI * 2); ctx.arc(x + 10, y - 25, 1.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ff6b9d';
-    ctx.beginPath(); ctx.ellipse(x, y - 16, 4, 3, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#2d1b69'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(x - 3, y - 11, 4, 1.1 * Math.PI, 1.9 * Math.PI); ctx.stroke();
-    ctx.beginPath(); ctx.arc(x + 3, y - 11, 4, 1.1 * Math.PI, 1.9 * Math.PI); ctx.stroke();
-    ctx.fillStyle = 'rgba(255,100,150,0.3)';
-    ctx.beginPath(); ctx.ellipse(x - 14, y - 16, 6, 4, 0, 0, Math.PI * 2); ctx.ellipse(x + 14, y - 16, 6, 4, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ff8cc8';
-    ctx.beginPath(); ctx.ellipse(x - 12, y + 42, 11, 6, 0, 0, Math.PI * 2); ctx.ellipse(x + 12, y + 42, 11, 6, 0, 0, Math.PI * 2); ctx.fill();
-  }
+function drawPlanet(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.arc(cx, cy, s * 0.5, 0, Math.PI * 2);
+  ctx.fillStyle = '#D1C4E9'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(-0.4);
+  ctx.beginPath(); ctx.ellipse(0, 0, s * 0.85, s * 0.22, 0, 0, Math.PI * 2);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
+}
 
-  _drawDino(ctx, x, y) {
-    ctx.fillStyle = '#6bcb77';
-    ctx.beginPath(); ctx.ellipse(x, y + 10, 34, 42, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#a8e6a3';
-    ctx.beginPath(); ctx.ellipse(x, y + 14, 20, 28, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#6bcb77';
-    ctx.beginPath(); ctx.arc(x, y - 24, 21, 0, Math.PI * 2); ctx.fill();
-    // 小角
-    ctx.fillStyle = '#4aad5c';
-    ctx.beginPath(); ctx.moveTo(x - 6, y - 44); ctx.lineTo(x - 2, y - 58); ctx.lineTo(x + 2, y - 44); ctx.closePath(); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(x + 2, y - 44); ctx.lineTo(x + 6, y - 58); ctx.lineTo(x + 12, y - 44); ctx.closePath(); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(x - 12, y - 44); ctx.lineTo(x - 8, y - 55); ctx.lineTo(x - 4, y - 44); ctx.closePath(); ctx.fill();
-    // 背脊
-    ctx.fillStyle = '#4aad5c';
-    ctx.beginPath(); ctx.moveTo(x - 15, y - 18); ctx.lineTo(x - 8, y - 38); ctx.lineTo(x, y - 20); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(x - 5, y - 19); ctx.lineTo(x + 2, y - 42); ctx.lineTo(x + 8, y - 20); ctx.fill();
-    ctx.fillStyle = '#2d1b69';
-    ctx.beginPath(); ctx.arc(x - 8, y - 28, 4, 0, Math.PI * 2); ctx.arc(x + 8, y - 28, 4, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.beginPath(); ctx.arc(x - 7, y - 29, 1.5, 0, Math.PI * 2); ctx.arc(x + 9, y - 29, 1.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#2d1b69';
-    ctx.beginPath(); ctx.ellipse(x, y - 19, 3.5, 2.5, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#2d1b69'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(x, y - 15, 5, 0.1 * Math.PI, 0.9 * Math.PI); ctx.stroke();
-    // 腮红
-    ctx.fillStyle = 'rgba(255,100,100,0.25)';
-    ctx.beginPath(); ctx.ellipse(x - 14, y - 20, 5, 3.5, 0, 0, Math.PI * 2); ctx.ellipse(x + 14, y - 20, 5, 3.5, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#4aad5c';
-    ctx.beginPath(); ctx.ellipse(x - 14, y + 46, 12, 7, 0, 0, Math.PI * 2); ctx.ellipse(x + 14, y + 46, 12, 7, 0, 0, Math.PI * 2); ctx.fill();
-  }
-
-  _drawTail(ctx, x, y, timestamp) {
-    const wobble = Math.sin(timestamp * 0.003 + this._breathPhase) * 8;
-    ctx.fillStyle = this._characterDef.color;
-    if (this._character === 'fox') {
-      ctx.beginPath();
-      ctx.moveTo(x - 20, y + 15);
-      ctx.quadraticCurveTo(x - 45, y + 5 + wobble, x - 50, y + 25);
-      ctx.quadraticCurveTo(x - 40, y + 20, x - 18, y + 35);
-      ctx.closePath(); ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.arc(x - 50, y + 22 + wobble * 0.5, 5, 0, Math.PI * 2); ctx.fill();
-    } else if (this._character === 'rabbit') {
-      ctx.beginPath(); ctx.arc(x - 25, y + 20 + wobble, 8, 0, Math.PI * 2); ctx.fill();
-    } else if (this._character === 'dino') {
-      ctx.beginPath(); ctx.moveTo(x + 18, y + 10);
-      ctx.quadraticCurveTo(x + 45, y + 5 + wobble, x + 48, y + 25);
-      ctx.quadraticCurveTo(x + 35, y + 20, x + 16, y + 35);
-      ctx.closePath(); ctx.fill();
-    }
-  }
-
-  // ─── 粒子绘制 ──────────────────────────────────────────────
-
-  _drawParticles(ctx) {
-    for (let i = this._particles.length - 1; i >= 0; i--) {
-      const p = this._particles[i];
-      p.x += p.vx; p.y += p.vy; p.alpha -= p.alphaDecay;
-      if (p.alpha <= 0) { this._particles.splice(i, 1); continue; }
-      ctx.save();
-      ctx.globalAlpha = p.alpha;
-      ctx.fillStyle = p.color;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  // ─── 连续步数进度标识 ──────────────────────────────────────
-
-  _drawStreakDots(ctx, w, h) {
-    if (this._streakDots.length === 0) return;
-    const dotR = 10, spacing = 14, totalW = this._streakDots.length * (dotR * 2 + spacing) - spacing;
-    let startX = w / 2 - totalW / 2;
-    const topY = 40;
-    for (const dot of this._streakDots) {
-      const cx = startX + dotR;
-      if (dot.flashing) {
-        const phase = Math.sin(performance.now() * 0.01) * 0.5 + 0.5;
-        ctx.fillStyle = `rgba(255, 215, 0, ${0.5 + phase * 0.5})`;
-        ctx.shadowColor = '#ffd700'; ctx.shadowBlur = 8;
-      } else if (dot.filled) {
-        ctx.fillStyle = '#ffd93d';
-      } else {
-        ctx.fillStyle = 'rgba(255,255,255,0.2)';
-      }
-      ctx.beginPath(); ctx.arc(cx, topY, dotR, 0, Math.PI * 2); ctx.fill();
-      if (!dot.filled) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.arc(cx, topY, dotR, 0, Math.PI * 2); ctx.stroke();
-      }
-      ctx.shadowBlur = 0;
-      startX += dotR * 2 + spacing;
-    }
-  }
-
-  // ─── 饥饿值进度条 ──────────────────────────────────────────
-
-  _drawHungerBar(ctx, w) {
-    const barW = 120, barH = 10, rx = w - barW - 20, ry = 30;
-    ctx.fillStyle = 'rgba(255,255,255,0.15)';
-    ctx.beginPath(); this._roundRect(ctx, rx, ry, barW, barH, 5); ctx.fill();
-    ctx.fillStyle = this._hunger >= 100 ? '#ffd93d' : '#6bcb77';
-    ctx.beginPath(); this._roundRect(ctx, rx, ry, barW * (this._hunger / 100), barH, 5); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = '12px "PingFang SC", sans-serif'; ctx.textAlign = 'right';
-    ctx.fillText(`❤️ ${this._hunger}%`, rx + barW, ry - 4);
-  }
-
-  _roundRect(ctx, x, y, w, h, r) {
-    ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    ctx.lineTo(x + r, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
+function drawRocket(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.ellipse(cx, cy, s * 0.28, s * 0.62, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  // 翼
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(cx + side * s * 0.28, cy + s * 0.2);
+    ctx.lineTo(cx + side * s * 0.6, cy + s * 0.62);
+    ctx.lineTo(cx + side * s * 0.28, cy + s * 0.55);
     ctx.closePath();
+    ctx.fillStyle = '#90CAF9'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
   }
+  // 火焰
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + s * 0.72, s * 0.16, s * 0.25, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#FF8C42'; ctx.fill();
+}
 
-  // ─── 收尾仪式 ──────────────────────────────────────────────
+function drawMoon(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.arc(cx, cy, s * 0.65, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + s * 0.3, cy - s * 0.1, s * 0.52, 0, Math.PI * 2);
+  ctx.fillStyle = '#1A237E'; ctx.fill();
+}
 
-  _drawOutro(ctx, w, h, timestamp) {
-    const outro = this._animations.outro;
-    const elapsed = timestamp - outro.startTime;
-
-    if (outro.phase === 'celebrate' && elapsed < 1000) {
-      ctx.fillStyle = 'rgba(255,255,255,0.06)';
-      ctx.fillRect(0, 0, w, h);
-      ctx.fillStyle = '#ffd93d';
-      ctx.font = `bold ${28 * this._scale}px "PingFang SC", sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.fillText('太棒了！✨', w / 2, h * 0.3);
-      // 庆祝粒子
-      for (let i = 0; i < 10; i++) {
-        const px = w / 2 + Math.cos(elapsed * 0.005 + i * 0.7) * 100;
-        const py = h * 0.3 + Math.sin(elapsed * 0.005 + i * 0.7) * 50;
-        ctx.fillStyle = ['#ff6b9d','#ffd93d','#6bcb77','#4d96ff'][i % 4];
-        ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI * 2); ctx.fill();
-      }
-    } else if (outro.phase === 'celebrate') {
-      outro.phase = 'showSteps'; outro.startTime = timestamp;
-    } else if (outro.phase === 'showSteps' && elapsed < 2000) {
-      ctx.fillStyle = 'rgba(15,15,35,0.7)';
-      ctx.fillRect(0, 0, w, h);
-      ctx.fillStyle = '#fff';
-      ctx.font = `bold ${32 * this._scale}px "PingFang SC", sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.fillText(`走了 ${this.totalSteps} 步！`, w / 2, h * 0.4);
-      ctx.font = `${22 * this._scale}px "PingFang SC", sans-serif`;
-      ctx.fillText(`最高连续 ${this.streakCount} 步`, w / 2, h * 0.48);
-      if (this._sceneUnlocked) {
-        ctx.fillStyle = '#ffd93d';
-        ctx.fillText(`🎉 解锁新场景：${this._sceneUnlocked === 'beach' ? '海滩 🏖️' : '太空 🚀'}`, w / 2, h * 0.56);
-      }
-    } else if (outro.phase === 'showSteps') {
-      outro.phase = 'sleep'; outro.startTime = timestamp;
-    } else if (outro.phase === 'sleep') {
-      ctx.fillStyle = 'rgba(15,15,35,0.85)';
-      ctx.fillRect(0, 0, w, h);
-      // 绘制蜷缩入睡的角色
-      const cx = w * 0.5, cy = h * 0.55;
-      ctx.save(); ctx.translate(cx, cy);
-      ctx.fillStyle = this._characterDef.color;
-      ctx.beginPath(); ctx.ellipse(0, 0, 28, 22, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#2d1b69'; ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.arc(-6, -4, 2, 0, Math.PI, false); ctx.stroke();
-      ctx.beginPath(); ctx.arc(6, -4, 2, 0, Math.PI, false); ctx.stroke();
-      ctx.fillStyle = '#2d1b69';
-      ctx.beginPath(); ctx.ellipse(0, 2, 3, 1.5, 0, 0, Math.PI * 2); ctx.fill();
-      // Zzz
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.font = '14px sans-serif'; ctx.textAlign = 'left';
-      const zAlpha = Math.sin(elapsed * 0.003) * 0.3 + 0.5;
-      ctx.globalAlpha = zAlpha;
-      ctx.fillText('Z', 20 + Math.sin(elapsed * 0.002) * 5, -10);
-      ctx.font = '11px sans-serif';
-      ctx.fillText('z', 30 + Math.sin(elapsed * 0.003) * 3, -28);
-      ctx.fillText('z', 38 + Math.sin(elapsed * 0.004) * 2, -42);
-      ctx.restore();
-    }
+function drawAlien(ctx, cx, cy, s) {
+  ctx.beginPath(); ctx.ellipse(cx, cy + s * 0.1, s * 0.5, s * 0.62, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#B2DFDB'; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.stroke();
+  // 触角
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(cx + side * s * 0.25, cy - s * 0.45);
+    ctx.quadraticCurveTo(cx + side * s * 0.55, cy - s * 0.9, cx + side * s * 0.5, cy - s * 1.0);
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx + side * s * 0.5, cy - s * 1.0, s * 0.1, 0, Math.PI * 2);
+    ctx.fillStyle = '#FFD93D'; ctx.fill();
   }
-
-  // ─── 工具方法 ──────────────────────────────────────────────
-
-  _ensureCanvasSize() {
-    const rect = this.canvas.parentElement
-      ? this.canvas.parentElement.getBoundingClientRect()
-      : { width: this.canvas.width, height: this.canvas.height };
-    this.canvas.width = rect.width || 1376;
-    this.canvas.height = rect.height || 768;
-    this._scale = Math.min(this.canvas.width / 1376, this.canvas.height / 768);
+  // 三只眼睛
+  for (const [dx, dy] of [[-0.22, -0.1], [0.22, -0.1], [0, -0.35]]) {
+    ctx.beginPath(); ctx.ellipse(cx + dx * s, cy + dy * s, s * 0.14, s * 0.18, 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#111'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + dx * s + s * 0.06, cy + dy * s - s * 0.06, s * 0.05, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff'; ctx.fill();
   }
 }
 

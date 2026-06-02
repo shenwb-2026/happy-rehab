@@ -1,555 +1,312 @@
-/**
- * 快乐康复指导 — 应用主入口
- *
- * 职责：
- * 1. 初始化所有模块（音频、UI、摄像头、MediaPipe、检测器、游戏）
- * 2. 连接检测层 → 游戏层的完整数据流
- * 3. 管理训练生命周期（用户交互 → 状态变更 → 模块调度）
- *
- * 主流程：
- * 1. 页面加载 → 初始化 SoundEngine
- * 2. 显示校准界面 → 等待用户点击"开始校准"
- * 3. 用户点击 → 启动摄像头 → 初始化 MediaPipe
- * 4. 校准：采集站立数据 → 计算基准参数 → 传给检测器
- * 5. 显示游戏选择界面 → 等待用户选择游戏
- * 6. 用户选择 → 创建对应 GameInterface 实例
- * 7. 创建 SessionManager → 注入检测器 + 游戏
- * 8. 开始训练 → session.startTraining()
- * 9. MediaPipe 逐帧 → detector.processFrame() → session.handleDetectionResult() → game.onStep()
- * 10. 用户操作（休息/结束）→ session 状态变更 → UI 切换
- */
+// 快乐康复指导 · 应用主入口
+// 连接所有模块，管理训练完整生命周期。
+// 流程：idle → calibrating → gameSelect → training ⇄ rest → ended
 
 import './styles/global.css';
 import { CAMERA_CONFIG, CALIBRATION_CONFIG } from './config.js';
-import { SoundEngine } from './audio/audio.js';
-import { UIManager } from './ui/ui-manager.js';
-import { CameraManager } from './core/camera.js';
+import { SoundEngine }    from './audio/audio.js';
+import { UIManager }      from './ui/ui-manager.js';
+import { CameraManager }  from './core/camera.js';
 import { MediaPipeManager } from './core/mediapipe.js';
 import { SignalDetector } from './detection/SignalDetector.js';
-import { SessionManager, SessionState } from './core/session.js';
-import { BubblePop } from './games/BubblePop/BubblePop.js';
+import { SessionManager } from './core/session.js';
+import { BubblePop }      from './games/BubblePop/BubblePop.js';
 import { CompanionJourney } from './games/CompanionJourney/CompanionJourney.js';
-import { LocalStore } from './storage/localstore.js';
+import { LocalStore }     from './storage/localstore.js';
 
-// =========================================================================
-// 全局模块引用
-// =========================================================================
-
-/** @type {SoundEngine} */
-let soundEngine;
-
-/** @type {UIManager} */
-let uiManager;
-
-/** @type {CameraManager|null} */
-let camera = null;
-
-/** @type {MediaPipeManager|null} */
+// ── 全局模块引用 ──────────────────────────────────────────────
+let sound    = null;
+let ui       = null;
+let camera   = null;
 let mediapipe = null;
+let detector = null;
+let session  = null;
+let game     = null;
+let canvas   = null;
 
-/** @type {SignalDetector} */
-let detector;
+// 校准采集缓冲
+let _calibSamples  = [];
+let _isCollecting  = false;
+let _calibTimers   = [];
 
-/** @type {Object|null} 当前激活的游戏模块 */
-let game = null;
-
-/** @type {SessionManager|null} */
-let session = null;
-
-/** @type {string|null} 选中的游戏 ID */
-let selectedGameId = null;
-
-/** @type {HTMLCanvasElement} 主 Canvas */
-let mainCanvas;
-
-/** @type {number|null} 校准倒计时定时器 */
-let calibrationCountdownTimer = null;
-
-/** @type {Array<Object>} 校准期间采集的样本缓存 */
-let calibrationSamples = [];
-
-/** @type {boolean} 校准是否正在进行中 */
-let isCalibrating = false;
-
-// =========================================================================
-// 主启动
-// =========================================================================
-
-/**
- * 应用主启动流程
- */
+// ── 应用启动 ──────────────────────────────────────────────────
 async function bootstrap() {
-  console.log('[快乐康复指导] 正在启动...');
+  canvas = document.getElementById('main-canvas');
+  if (!canvas) throw new Error('找不到 #main-canvas');
 
-  // 1. 获取主 Canvas 引用
-  mainCanvas = document.getElementById('main-canvas');
-  if (!mainCanvas) {
-    throw new Error('找不到 #main-canvas 元素');
-  }
+  _resizeCanvas();
+  window.addEventListener('resize',            _resizeCanvas);
+  window.addEventListener('orientationchange', () => setTimeout(_resizeCanvas, 200));
 
-  // 设置 Canvas 尺寸
-  resizeMainCanvas();
-  window.addEventListener('resize', resizeMainCanvas);
-  window.addEventListener('orientationchange', () => setTimeout(resizeMainCanvas, 200));
-
-  // 2. 初始化音效引擎（延迟初始化 AudioContext）
-  soundEngine = new SoundEngine();
-
-  // 3. 初始化检测器
+  sound    = new SoundEngine();
   detector = new SignalDetector();
 
-  // 4. 创建 UI 管理器并绑定回调
-  uiManager = new UIManager({
-    onStartCalibration: handleStartCalibration,
-    onStartTraining: handleStartTraining,
-    onStartRest: handleStartRest,
-    onEndRest: handleEndRest,
-    onEndSession: handleEndSession,
-    onGameSelected: handleGameSelected,
+  // 尝试加载已保存的校准参数
+  const saved = LocalStore.getCalibration();
+  if (saved) detector.setCalibration(saved);
+
+  session = new SessionManager({
+    detector,
+    onStateChange: _onStateChange,
+    onStepCount:   _onStepCount,
   });
 
-  // 5. 尝试加载已保存的校准参数
-  const savedCalibration = LocalStore.getCalibration();
-  if (savedCalibration) {
-    detector.setCalibration(savedCalibration);
-    console.log('[快乐康复指导] 已加载校准参数');
-  }
+  ui = new UIManager({
+    onStartCalibration: _handleStartCalibration,
+    onGameSelected:     _handleGameSelected,
+    onStartRest:        _handleStartRest,
+    onEndRest:          _handleEndRest,
+    onEndSession:       _handleEndSession,
+    onAgain:            _handleAgain,
+  });
 
-  // 6. 显示校准界面
-  uiManager.showCalibration();
+  // 初始界面：直接显示校准
+  ui.showCalibration();
 
-  console.log('[快乐康复指导] 启动完成 ✓');
+  console.log('[HRG] 启动完成');
 }
 
-// =========================================================================
-// Canvas 调整
-// =========================================================================
-
-function resizeMainCanvas() {
-  if (!mainCanvas) return;
+function _resizeCanvas() {
   const app = document.getElementById('app');
-  if (!app) return;
-
-  const parentW = app.clientWidth;
-  const parentH = app.clientHeight;
-  const scale = Math.min(parentW / CAMERA_CONFIG.width, parentH / CAMERA_CONFIG.height);
-
-  mainCanvas.width = CAMERA_CONFIG.width * scale;
-  mainCanvas.height = CAMERA_CONFIG.height * scale;
-  mainCanvas.style.width = `${CAMERA_CONFIG.width * scale}px`;
-  mainCanvas.style.height = `${CAMERA_CONFIG.height * scale}px`;
+  if (!app || !canvas) return;
+  const W = app.clientWidth, H = app.clientHeight;
+  const scale = Math.min(W / CAMERA_CONFIG.width, H / CAMERA_CONFIG.height);
+  canvas.width  = Math.round(CAMERA_CONFIG.width  * scale);
+  canvas.height = Math.round(CAMERA_CONFIG.height * scale);
+  canvas.style.width  = canvas.width  + 'px';
+  canvas.style.height = canvas.height + 'px';
 }
 
-// =========================================================================
-// 校准流程
-// =========================================================================
+// ── 校准流程 ──────────────────────────────────────────────────
 
-/**
- * 用户点击"开始校准"
- */
-async function handleStartCalibration() {
-  console.log('[App] 开始校准流程');
+async function _handleStartCalibration() {
+  console.log('[HRG] 开始校准');
+  sound?._ensureContext?.(); // 触发 AudioContext（用户交互时）
+
   try {
-    // 创建并启动摄像头
-    camera = new CameraManager();
-    const videoElement = await camera.start();
+    camera    = new CameraManager();
+    const video = await camera.start();
 
-    // 更新 UI 的摄像头预览
-    uiManager.updateCalibrationPreview(camera.stream);
+    ui.updateCalibrationPreview(camera.stream);
 
-    // 创建并初始化 MediaPipe
     mediapipe = new MediaPipeManager({
-      onLandmarks: handleCalibrationLandmarks,
-      onError: (err) => {
-        console.error('[App] MediaPipe 错误:', err.message);
-      },
+      onLandmarks: _onCalibLandmarks,
+      onError: err => console.error('[MediaPipe]', err.message),
     });
     await mediapipe.initialize();
+    mediapipe.start(video);
 
-    // 开始帧处理
-    mediapipe.start(videoElement);
+    session.startCalibration();
 
-    // 重置校准状态
-    calibrationSamples = [];
-    isCalibrating = false;
+    // 倒计时 3 秒提示
+    let countdown = Math.ceil(CALIBRATION_CONFIG.promptDurationMs / 1000);
+    ui.showCalibrationCountdown(countdown);
 
-    // 启动 3 秒准备倒计时
-    startCalibrationCountdown(CALIBRATION_CONFIG.promptDurationMs);
+    const countInterval = setInterval(() => {
+      countdown--;
+      if (countdown > 0) {
+        ui.showCalibrationCountdown(countdown);
+      } else {
+        clearInterval(countInterval);
+        ui.hideCalibrationCountdown();
+        // 开始采集
+        _calibSamples  = [];
+        _isCollecting  = true;
+
+        const collectTimer = setTimeout(() => {
+          _isCollecting = false;
+          _finishCalibration();
+        }, CALIBRATION_CONFIG.collectDurationMs);
+        _calibTimers.push(collectTimer);
+      }
+    }, 1000);
+    _calibTimers.push(countInterval);
 
   } catch (err) {
-    console.error('[App] 校准启动失败:', err.message);
+    console.error('[HRG] 校准启动失败:', err.message);
     alert(`校准启动失败：${err.message}`);
   }
 }
 
-/**
- * 启动校准倒计时
- *
- * @param {number} durationMs - 倒计时总时长
- */
-function startCalibrationCountdown(durationMs) {
-  let remaining = Math.floor(durationMs / 1000);
-  uiManager.showCalibrationCountdown(remaining);
-
-  calibrationCountdownTimer = setInterval(() => {
-    remaining--;
-    if (remaining <= 0) {
-      clearInterval(calibrationCountdownTimer);
-      calibrationCountdownTimer = null;
-      uiManager.hideCalibrationCountdown();
-
-      // 倒计时结束，开始采集
-      isCalibrating = true;
-      calibrationSamples = [];
-      console.log('[App] 开始采集校准数据...');
-
-      // 采集 CALIBRATION_CONFIG.sampleFrames 帧
-      const sampleDuration = (CALIBRATION_CONFIG.sampleFrames / 30) * 1000; // 假设 30fps
-      setTimeout(() => {
-        finishCalibration();
-      }, sampleDuration);
-    } else {
-      uiManager.showCalibrationCountdown(remaining);
-    }
-  }, 1000);
-}
-
-/**
- * 校准期间的 landmarks 回调
- *
- * @param {Array|null} landmarks
- */
-function handleCalibrationLandmarks(landmarks) {
+function _onCalibLandmarks(landmarks) {
   if (!landmarks) return;
+  ui.updateConfidenceIndicators(landmarks);
+  if (!_isCollecting) return;
 
-  // 更新置信度指示器
-  uiManager.updateConfidenceIndicators(landmarks);
+  const lh = landmarks[23], rh = landmarks[24];
+  const ls = landmarks[11], rs = landmarks[12];
+  if (!lh || !rh || !ls || !rs) return;
+  if (lh.visibility < 0.5 || rh.visibility < 0.5) return;
+  if (ls.visibility < 0.5 || rs.visibility < 0.5) return;
 
-  // 仅在采集阶段累积样本
-  if (!isCalibrating) return;
-
-  // 提取左侧/右侧髋关节和肩关节坐标
-  const leftHip = landmarks[23];
-  const rightHip = landmarks[24];
-  const leftShoulder = landmarks[11];
-  const rightShoulder = landmarks[12];
-
-  // 置信度检查
-  if (
-    leftHip.visibility < 0.5 ||
-    rightHip.visibility < 0.5 ||
-    leftShoulder.visibility < 0.5 ||
-    rightShoulder.visibility < 0.5
-  ) {
-    return; // 置信度不足，跳过此帧
-  }
-
-  // 计算髋关节中点 X
-  const midX = (leftHip.x + rightHip.x) / 2;
-  // 计算肩宽（像素级需要结合视频分辨率）
-  const shoulderWidthNorm = Math.abs(leftShoulder.x - rightShoulder.x);
-  // 髋关节 Y（站立基准）
-  const hipY = (leftHip.y + rightHip.y) / 2;
-
-  calibrationSamples.push({
-    midX,
-    shoulderWidthNorm,
-    hipY,
-    timestamp: Date.now(),
+  _calibSamples.push({
+    midX:           (lh.x + rh.x) / 2,
+    shoulderWidthN: Math.abs(ls.x - rs.x),
+    hipY:           (lh.y + rh.y) / 2,
   });
 }
 
-/**
- * 校准采集完成，计算基准参数
- */
-function finishCalibration() {
-  isCalibrating = false;
-
-  if (calibrationSamples.length < 5) {
-    console.warn('[App] 校准样本不足，使用默认参数');
-    // 使用保守默认值
-    const params = {
-      hipNeutralX: 0.5,
-      shoulderWidthPx: 100,
-      baselineTremorAmplitude: 0.005,
-      standingHipY: 0.65,
-    };
-    detector.setCalibration(params);
-    LocalStore.saveCalibration(params);
-    uiManager.showCalibrationReady({
-      shoulderWidth: params.shoulderWidthPx,
-      hipHeight: params.standingHipY,
-    });
+function _finishCalibration() {
+  if (_calibSamples.length < 5) {
+    // 样本不足，使用保守默认值
+    _applyCalibration({ hipNeutralX: 0.5, shoulderWidthPx: 100, baselineTremorAmplitude: 0.005, standingHipY: 0.65 });
     return;
   }
 
-  // 计算平均值
-  const avgMidX = calibrationSamples.reduce((s, v) => s + v.midX, 0) / calibrationSamples.length;
-  const avgShoulderWidth = calibrationSamples.reduce((s, v) => s + v.shoulderWidthNorm, 0) / calibrationSamples.length;
-  const avgHipY = calibrationSamples.reduce((s, v) => s + v.hipY, 0) / calibrationSamples.length;
+  const n = _calibSamples.length;
+  const avgMidX    = _calibSamples.reduce((s,v) => s + v.midX,           0) / n;
+  const avgShoulder = _calibSamples.reduce((s,v) => s + v.shoulderWidthN, 0) / n;
+  const avgHipY    = _calibSamples.reduce((s,v) => s + v.hipY,           0) / n;
 
-  // 计算基线震颤幅度（标准差）
-  const squaredDiffs = calibrationSamples.map((v) => (v.midX - avgMidX) ** 2);
-  const variance = squaredDiffs.reduce((s, v) => s + v, 0) / squaredDiffs.length;
-  const tremorAmplitude = Math.sqrt(variance);
+  const variance = _calibSamples.reduce((s,v) => s + (v.midX - avgMidX) ** 2, 0) / n;
+  const tremor   = Math.sqrt(variance);
 
-  // 计算像素级肩宽（需要确认视频实际分辨率）
-  const videoEl = camera?.getVideoElement();
-  const videoWidth = videoEl ? (videoEl.videoWidth || 1376) : 1376;
-  const shoulderWidthPx = avgShoulderWidth * videoWidth;
+  const videoW   = camera?.getVideoElement()?.videoWidth ?? 1376;
+  const shoulderPx = Math.round(avgShoulder * videoW);
 
-  const params = {
-    hipNeutralX: avgMidX,
-    shoulderWidthPx: Math.round(shoulderWidthPx),
-    baselineTremorAmplitude: tremorAmplitude,
-    standingHipY: avgHipY,
-  };
+  _applyCalibration({
+    hipNeutralX:             avgMidX,
+    shoulderWidthPx:         shoulderPx,
+    baselineTremorAmplitude: tremor,
+    standingHipY:            avgHipY,
+  });
+}
 
-  console.log('[App] 校准完成:', params);
-
-  // 传给检测器
-  detector.setCalibration(params);
-
-  // 保存到 localStorage
+function _applyCalibration(params) {
+  console.log('[HRG] 校准参数:', params);
+  session.setCalibration(params);
   LocalStore.saveCalibration(params);
+  ui.showCalibrationReady({ shoulderWidth: params.shoulderWidthPx });
 
-  // 更新 UI
-  uiManager.showCalibrationReady({
-    shoulderWidth: params.shoulderWidthPx,
-    hipHeight: params.standingHipY,
-  });
-
-  calibrationSamples = [];
+  // 绑定"开始训练"按钮到 enterGameSelect
+  const btnTrain = document.getElementById('btn-start-training');
+  if (btnTrain) {
+    // 移除旧监听后重新绑定，避免重复
+    const handler = () => _enterGameSelect();
+    btnTrain.replaceWith(btnTrain.cloneNode(true));
+    document.getElementById('btn-start-training').addEventListener('click', handler);
+  }
 }
 
-// =========================================================================
-// 游戏选择流程
-// =========================================================================
+// ── 游戏选择 ──────────────────────────────────────────────────
 
-/**
- * 用户点击"开始训练"（校准完成后）
- */
-function handleStartTraining() {
-  console.log('[App] 用户点击开始训练');
-
-  // 清理校准阶段的倒计时
-  if (calibrationCountdownTimer !== null) {
-    clearInterval(calibrationCountdownTimer);
-    calibrationCountdownTimer = null;
-  }
-
-  // 显示游戏选择界面
-  uiManager.showGameSelection();
+function _enterGameSelect() {
+  // 切换 mediapipe 回调：gameSelect 期间继续运行但忽略结果
+  if (mediapipe) mediapipe.onLandmarks = () => {};
+  session.enterGameSelect();
+  ui.showGameSelection();
 }
 
-/**
- * 游戏被选择
- *
- * @param {string} gameId - 'bubble' | 'companion'
- */
-function handleGameSelected(gameId) {
-  console.log(`[App] 游戏已选择: ${gameId}`);
-  selectedGameId = gameId;
+function _handleGameSelected(gameId) {
+  console.log('[HRG] 游戏选择:', gameId);
+  sound?._ensureContext?.();
 
-  // 1. 更新 MediaPipe 的 landmarks 回调（从校准切换到训练）
-  if (mediapipe) {
-    mediapipe.onLandmarks = handleTrainingLandmarks;
-  }
-
-  // 2. 创建游戏模块
   if (gameId === 'bubble') {
-    game = new BubblePop(mainCanvas, soundEngine);
-  } else if (gameId === 'companion') {
-    game = new CompanionJourney(mainCanvas, soundEngine);
+    game = new BubblePop(canvas, sound);
   } else {
-    console.error(`[App] 未知游戏: ${gameId}`);
-    return;
+    game = new CompanionJourney(canvas, sound);
   }
 
-  // 3. 创建 SessionManager
-  session = new SessionManager({
-    detector,
-    game,
-    onStateChange: handleSessionStateChange,
-    onStepCount: handleStepCountUpdate,
-  });
+  session.setGame(game);
 
-  // 4. 开始训练
+  // 切换 mediapipe 回调到训练模式
+  if (mediapipe) mediapipe.onLandmarks = _onTrainingLandmarks;
+
   session.startTraining();
-
-  // 5. 切换到训练 UI
-  uiManager.showTraining();
-
-  console.log('[App] 训练已开始');
+  ui.showTraining();
 }
 
-// =========================================================================
-// 训练流程
-// =========================================================================
+// ── 训练流程 ──────────────────────────────────────────────────
 
-/**
- * 训练期间的 landmarks 回调
- *
- * @param {Array|null} landmarks
- */
-function handleTrainingLandmarks(landmarks) {
-  if (!landmarks || !detector || !session) return;
-
-  // 检测器处理
+function _onTrainingLandmarks(landmarks) {
+  if (!landmarks || !session) return;
   const result = detector.processFrame(landmarks);
-
-  // 调度给 SessionManager
   session.handleDetectionResult(result);
 
-  // 低置信度 / 摔倒警告转发到 UI
   if (result.status === 'LOW_CONFIDENCE') {
-    uiManager.showLowConfidenceWarning(result.reason);
-  } else if (result.status === 'FALL_DETECTED') {
-    uiManager.showFallWarning();
+    ui.showLowConfidenceWarning(result.reason);
   }
 }
 
-/**
- * Session 状态变更回调
- *
- * @param {string} newState
- * @param {string} oldState
- * @param {Object} [extra]
- */
-function handleSessionStateChange(newState, oldState, extra) {
-  console.log(`[App] 会话状态: ${oldState} → ${newState}`);
-
-  if (extra) {
-    // 处理特殊警告事件
-    if (extra.alert === 'lowConfidence') {
-      uiManager.showLowConfidenceWarning(extra.reason);
-      return;
-    }
-    if (extra.alert === 'fallDetected') {
-      uiManager.showFallWarning();
-      return;
-    }
+function _onStateChange(newState, oldState, extra) {
+  if (extra?.alert === 'lowConfidence') {
+    ui.showLowConfidenceWarning(extra.reason);
   }
 }
 
-/**
- * 步数更新回调
- *
- * @param {number} totalSteps
- * @param {number} streakCount
- */
-function handleStepCountUpdate(totalSteps, streakCount) {
-  // 计算饥饿值（陪伴之旅用）
-  let hunger = 0;
-  if (selectedGameId === 'companion' && game) {
-    hunger = Math.min(100, totalSteps * 5); // HUNGER_PER_STEP = 5
-  }
-
-  uiManager.updateHUD({
-    steps: totalSteps,
-    streak: streakCount,
-    hunger: selectedGameId === 'companion' ? hunger : undefined,
-  });
+function _onStepCount(totalSteps, streak) {
+  ui.updateHUD({ steps: totalSteps, streak });
 }
 
-// =========================================================================
-// 休息流程
-// =========================================================================
+// ── 休息流程 ──────────────────────────────────────────────────
 
-/**
- * 治疗师点击"休息"
- */
-function handleStartRest() {
-  if (!session) return;
-
-  console.log('[App] 进入休息模式');
+function _handleStartRest() {
   session.startRest();
-  uiManager.showRest();
-
-  // 低置信度警告可能残留，清除
-  uiManager.hideLowConfidenceWarning();
+  ui.showRest();
+  ui.hideLowConfidenceWarning();
 }
 
-/**
- * 儿童点击"继续"
- */
-function handleEndRest() {
-  if (!session) return;
-
-  console.log('[App] 退出休息模式');
+function _handleEndRest() {
   session.endRest();
-  uiManager.showTraining();
+  ui.showTraining();
 }
 
-// =========================================================================
-// 结束流程
-// =========================================================================
+// ── 结束流程 ──────────────────────────────────────────────────
 
-/**
- * 治疗师点击"结束训练"
- */
-function handleEndSession() {
-  if (!session) return;
-
-  console.log('[App] 结束训练');
-
-  // 获取训练总结
+function _handleEndSession() {
   const summary = session.endSession();
 
-  // 保存到 localStorage
   LocalStore.saveSessionSummary(summary);
-  LocalStore.addTotalSteps(summary.totalSteps || 0);
+  LocalStore.addTotalSteps(summary.totalSteps ?? 0);
 
-  // 保存场景进度（陪伴之旅）
-  if (selectedGameId === 'companion') {
-    const totalAccumSteps = LocalStore.getTotalSteps();
-    if (totalAccumSteps >= 100) {
-      LocalStore.saveScene('space');
-    } else if (totalAccumSteps >= 50) {
-      LocalStore.saveScene('beach');
-    }
-  }
-
-  // 停止 MediaPipe
-  if (mediapipe) {
-    mediapipe.stop();
-  }
-
-  // 停止摄像头
-  if (camera) {
-    camera.stop();
-    camera = null;
-  }
+  // 停止 mediapipe 和摄像头
+  mediapipe?.stop();
+  camera?.stop();
+  camera = null;
 
   // 销毁游戏
-  if (game) {
-    game.destroy();
-    game = null;
-  }
+  game?.destroy();
+  game = null;
 
-  // 显示总结界面
-  uiManager.showSessionSummary(summary);
+  // 清空计时器
+  _calibTimers.forEach(t => { clearTimeout(t); clearInterval(t); });
+  _calibTimers = [];
 
-  session = null;
+  ui.showSessionSummary(summary);
 }
 
-// =========================================================================
-// 启动
-// =========================================================================
+function _handleAgain() {
+  // 重置会话，回到校准界面
+  if (session) {
+    session = new SessionManager({
+      detector,
+      onStateChange: _onStateChange,
+      onStepCount:   _onStepCount,
+    });
+    const saved = LocalStore.getCalibration();
+    if (saved) {
+      detector.setCalibration(saved);
+      session.startCalibration();
+      session.enterGameSelect();
+      ui.showGameSelection();
+    } else {
+      ui.showCalibration();
+    }
+  } else {
+    ui.showCalibration();
+  }
+}
 
-bootstrap().catch((err) => {
-  console.error('[快乐康复指导] 启动失败:', err);
-
+// ── 启动 ──────────────────────────────────────────────────────
+bootstrap().catch(err => {
+  console.error('[HRG] 启动失败:', err);
   const app = document.getElementById('app');
   if (app) {
     app.innerHTML = `
-      <div style="
-        display: flex; align-items: center; justify-content: center;
-        height: 100%; color: #F472B6; font-size: 20px;
-        background: #0f0f23; text-align: center; padding: 40px;
-      ">
-        <p>应用启动失败，请刷新页面或检查网络连接。</p>
-      </div>
-    `;
+      <div style="display:flex;align-items:center;justify-content:center;
+        height:100%;color:#FFD93D;font-size:22px;background:#0a001a;
+        text-align:center;padding:40px;">
+        <p>应用启动失败，请刷新页面重试。<br><small>${err.message}</small></p>
+      </div>`;
   }
 });
