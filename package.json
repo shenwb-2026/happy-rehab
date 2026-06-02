@@ -1,0 +1,19 @@
+{
+  "name": "happy-rehab",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "快乐康复指导 - 基于 MediaPipe 的横屏康复训练 PWA",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.18"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5",
+    "vite-plugin-pwa": "^0.21.2"
+  }
+}
