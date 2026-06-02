@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1a1a2e" />
+    <meta name="description" content="快乐康复指导 - 基于 MediaPipe 的横屏康复训练应用" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/happy-rehab/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/happy-rehab/icons/icon-512.png" />
+    <title>快乐康复指导</title>
+    <script type="module" crossorigin src="/happy-rehab/assets/index-DC4rqxxh.js"></script>
+    <link rel="stylesheet" crossorigin href="/happy-rehab/assets/index-CbJ0Bo-l.css">
+  <link rel="manifest" href="/happy-rehab/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/happy-rehab/registerSW.js"></script></head>
+  <body>
+    <div id="app">
+      <canvas id="main-canvas"></canvas>
+
+      <!-- 设备方向提示（竖屏时显示） -->
+      <div id="orientation-hint">
+        <div class="orientation-icon">📱</div>
+        <div class="orientation-text">请旋转手机至横屏模式</div>
+        <div class="orientation-arrow">↻</div>
+      </div>
+
+      <!-- UI 层容器（叠加在 Canvas 之上） -->
+      <div id="ui-layer">
+
+        <!-- 校准界面 -->
+        <div id="screen-calibration" class="screen">
+          <!-- 摄像头预览区域 -->
+          <div id="calibration-video-container"></div>
+
+          <!-- 置信度指示器 -->
+          <div id="confidence-indicators">
+            <div class="conf-dot" id="conf-left-hip" title="左髋"></div>
+            <span class="conf-label">左髋</span>
+            <div class="conf-dot" id="conf-right-hip" title="右髋"></div>
+            <span class="conf-label">右髋</span>
+            <div class="conf-dot" id="conf-left-knee" title="左膝"></div>
+            <span class="conf-label">左膝</span>
+            <div class="conf-dot" id="conf-right-knee" title="右膝"></div>
+            <span class="conf-label">右膝</span>
+          </div>
+
+          <!-- 倒计时数字 -->
+          <div id="calibration-countdown" class="hidden">5</div>
+
+          <!-- 校准状态文字 -->
+          <div id="calibration-status"></div>
+
+          <!-- 按钮区 -->
+          <div style="display:flex;gap:16px;margin-top:16px;">
+            <button id="btn-start-calibration" class="btn btn-primary btn-lg">开始校准</button>
+            <button id="btn-start-training" class="btn btn-success btn-lg hidden">开始训练</button>
+          </div>
+        </div>
+
+        <!-- 游戏选择界面 -->
+        <div id="screen-game-select" class="screen hidden">
+          <div id="game-cards">
+            <!-- 泡泡消除卡片 -->
+            <div class="game-card" data-game="bubble">
+              <canvas id="preview-bubble" class="preview-canvas" width="300" height="200"></canvas>
+              <div class="game-title">泡泡消除</div>
+              <div class="game-desc">行走破泡泡，简单好玩的视觉反馈</div>
+              <button id="btn-select-bubble" class="btn-select">选择</button>
+            </div>
+
+            <!-- 陪伴之旅卡片 -->
+            <div class="game-card" data-game="companion">
+              <canvas id="preview-companion" class="preview-canvas" width="300" height="200"></canvas>
+              <div class="game-title">陪伴之旅</div>
+              <div class="game-desc">和小伙伴一起散步冒险</div>
+              <button id="btn-select-companion" class="btn-select">选择</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 训练界面（HUD 叠加层） -->
+        <div id="screen-training" class="screen hidden">
+          <div id="hud-steps">👣 0步</div>
+          <div id="hud-timer">00:00</div>
+          <div id="hud-streak" class="hidden">🔥 连0步</div>
+          <div id="hud-hunger">❤️ 0%</div>
+          <button id="btn-rest" title="休息">💤</button>
+          <button id="btn-end" title="结束训练（长按）">⏹</button>
+
+          <!-- 低置信度警告横幅 -->
+          <div id="warning-banner" class="hidden">⚠️ 请调整摄像头位置</div>
+
+          <!-- 摔倒/坐下检测遮罩 -->
+          <div id="fall-overlay" class="hidden"></div>
+        </div>
+
+        <!-- 休息界面 -->
+        <div id="screen-rest" class="screen hidden">
+          <button id="btn-continue">继续</button>
+        </div>
+
+        <!-- 训练总结界面 -->
+        <div id="screen-summary" class="screen hidden">
+          <div id="summary-stats">
+            <div class="stat-card">
+              <div class="stat-icon">👣</div>
+              <div class="stat-value" id="summary-total-steps">0</div>
+              <div class="stat-label">总步数</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon">⏱️</div>
+              <div class="stat-value" id="summary-duration">0分0秒</div>
+              <div class="stat-label">训练时长</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon">🔥</div>
+              <div class="stat-value" id="summary-max-streak">0</div>
+              <div class="stat-label">最高连续步数</div>
+            </div>
+          </div>
+          <button id="btn-again">再来一次</button>
+          <button id="btn-home">返回首页</button>
+        </div>
+
+      </div>
+    </div>
+  </body>
+</html>
