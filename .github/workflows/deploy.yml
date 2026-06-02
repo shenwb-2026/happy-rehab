@@ -1,0 +1,30 @@
+# .github/workflows/deploy.yml
+name: 部署到 GitHub Pages
+
+on:
+  push:
+    branches: ["main"]  # 当 main 分支有推送时，自动执行
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+      - name: 上传产物
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'  # 上传仓库根目录作为网站内容
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
